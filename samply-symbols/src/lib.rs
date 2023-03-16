@@ -241,6 +241,7 @@ mod dwarf;
 mod elf;
 mod error;
 mod external_file;
+mod jitdump;
 mod macho;
 mod mapped_path;
 mod path_mapper;
@@ -249,7 +250,7 @@ mod symbol_map;
 mod symbol_map_object;
 mod windows;
 
-pub use crate::binary_image::BinaryImage;
+pub use crate::binary_image::{BinaryImage, CodeByteReadingError};
 pub use crate::breakpad::{
     BreakpadIndex, BreakpadIndexParser, BreakpadParseError, BreakpadSymindexParseError,
 };
@@ -258,6 +259,7 @@ pub use crate::compact_symbol_table::CompactSymbolTable;
 pub use crate::debugid_util::{debug_id_for_object, DebugIdExt};
 pub use crate::error::Error;
 pub use crate::external_file::{load_external_file, ExternalFileSymbolMap};
+pub use crate::jitdump::debug_id_and_code_id_for_jitdump;
 pub use crate::macho::FatArchiveMember;
 pub use crate::mapped_path::MappedPath;
 pub use crate::shared::{
@@ -599,7 +601,7 @@ where
                     .await
                 }
                 FileKind::MachOFat32 | FileKind::MachOFat64 => {
-                    let range = macho::get_fat_archive_member_range(
+                    let member = macho::get_fat_archive_member(
                         &file_contents,
                         file_kind,
                         multi_arch_disambiguator,
@@ -607,7 +609,7 @@ where
                     macho::get_symbol_map_for_fat_archive_member(
                         file_location,
                         file_contents,
-                        range,
+                        member,
                     )
                 }
                 FileKind::MachO32 | FileKind::MachO64 => {
@@ -650,6 +652,8 @@ where
                 file_location,
                 index_file_contents,
             )
+        } else if jitdump::is_jitdump_file(&file_contents) {
+            jitdump::get_symbol_map_for_jitdump(file_contents, file_location)
         } else {
             Err(Error::InvalidInputError(
             "The file does not have a known format; PDB::open was not able to parse it and object::FileKind::parse was not able to detect the format.",
@@ -672,23 +676,33 @@ where
 
         let file_contents = FileContentsWrapper::new(file_contents);
 
-        let file_kind = FileKind::parse(&file_contents)
-            .map_err(|_| Error::InvalidInputError("Unrecognized file"))?;
+        let file_kind = match FileKind::parse(&file_contents) {
+            Ok(file_kind) => file_kind,
+            Err(_) if jitdump::is_jitdump_file(&file_contents) => {
+                let inner = BinaryImageInner::JitDump(file_contents);
+                return BinaryImage::new(inner, name, path);
+            }
+            Err(_) => {
+                return Err(Error::InvalidInputError("Unrecognized file"));
+            }
+        };
         let inner = match file_kind {
             FileKind::Elf32
             | FileKind::Elf64
             | FileKind::MachO32
             | FileKind::MachO64
             | FileKind::Pe32
-            | FileKind::Pe64 => BinaryImageInner::Normal(file_contents),
+            | FileKind::Pe64 => BinaryImageInner::Normal(file_contents, file_kind),
             FileKind::MachOFat32 | FileKind::MachOFat64 => {
-                let (offset, size) = macho::get_fat_archive_member_range(
+                let member = macho::get_fat_archive_member(
                     &file_contents,
                     file_kind,
                     multi_arch_disambiguator,
                 )?;
-                let data = macho::MachOFatArchiveMemberData::new(file_contents, offset, size);
-                BinaryImageInner::MemberOfFatArchive(data)
+                let (offset, size) = member.offset_and_size;
+                let arch = member.arch;
+                let data = macho::MachOFatArchiveMemberData::new(file_contents, offset, size, arch);
+                BinaryImageInner::MemberOfFatArchive(data, file_kind)
             }
             _ => {
                 return Err(Error::InvalidInputError(
@@ -696,6 +710,6 @@ where
                 ))
             }
         };
-        BinaryImage::new(inner, name, path, file_kind)
+        BinaryImage::new(inner, name, path)
     }
 }

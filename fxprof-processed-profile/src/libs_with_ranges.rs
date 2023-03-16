@@ -1,95 +1,48 @@
-use std::hash::Hash;
-
-use crate::fast_hash_map::FastHashMap;
-use crate::global_lib_table::{GlobalLibIndex, GlobalLibTable};
-use crate::lib_info::Lib;
-use crate::LibraryInfo;
-
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-struct InternalLibIndex(usize);
-
 #[derive(Debug, Clone)]
-pub struct LibsWithRanges {
-    libs: Vec<Lib>,
-    lib_ranges: LibRanges<InternalLibIndex>,
-    used_libs: FastHashMap<InternalLibIndex, GlobalLibIndex>,
+pub struct LibMappings<T> {
+    sorted_lib_ranges: Vec<Mapping<T>>,
 }
 
-impl LibsWithRanges {
-    pub fn new() -> Self {
-        Self {
-            libs: Vec::new(),
-            lib_ranges: LibRanges::new(),
-            used_libs: FastHashMap::default(),
-        }
-    }
-
-    pub fn add_lib(&mut self, lib: LibraryInfo) {
-        let lib_index = InternalLibIndex(self.libs.len());
-        self.libs.push(Lib {
-            name: lib.name,
-            debug_name: lib.debug_name,
-            path: lib.path,
-            debug_path: lib.debug_path,
-            arch: lib.arch,
-            debug_id: lib.debug_id,
-            code_id: lib.code_id,
-            symbol_table: lib.symbol_table,
-        });
-
-        self.lib_ranges.insert(LibRange {
-            lib_index,
-            base: lib.base_avma,
-            start: lib.avma_range.start,
-            end: lib.avma_range.end,
-        });
-    }
-
-    pub fn unload_lib(&mut self, base_address: u64) {
-        self.lib_ranges.remove(base_address);
-    }
-
-    pub fn convert_address(
-        &mut self,
-        global_libs: &mut GlobalLibTable,
-        address: u64,
-    ) -> Option<(u32, GlobalLibIndex)> {
-        let range = match self.lib_ranges.lookup(address) {
-            Some(range) => range,
-            None => return None,
-        };
-        let relative_address = (address - range.base) as u32;
-        let lib = &self.libs[range.lib_index.0];
-        let global_lib_index = *self
-            .used_libs
-            .entry(range.lib_index)
-            .or_insert_with(|| global_libs.index_for_lib(lib.clone()));
-        Some((relative_address, global_lib_index))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct LibRanges<I> {
-    sorted_lib_ranges: Vec<LibRange<I>>,
-}
-
-impl<I> Default for LibRanges<I> {
+impl<T> Default for LibMappings<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I> LibRanges<I> {
+impl<T> LibMappings<T> {
     pub fn new() -> Self {
         Self {
             sorted_lib_ranges: Vec::new(),
         }
     }
 
-    pub fn insert(&mut self, range: LibRange<I>) {
+    /// Add a mapping to this process.
+    ///
+    /// `start_avma..end_avma` describe the address range that this mapping
+    /// occupies in the virtual memory address space of the process.
+    /// AVMA = "actual virtual memory address"
+    ///
+    /// `relative_address_at_start` is the "relative address" which corresponds
+    /// to `start_avma`, in the library that is mapped in this mapping. A relative
+    /// address is a `u32` value which is relative to the library base address.
+    /// So you will usually set `relative_address_at_start` to `start_avma - base_avma`.
+    ///
+    /// For ELF binaries, the base address is AVMA of the first segment, i.e. the
+    /// start_avma of the mapping created by the first ELF `LOAD` command.
+    ///
+    /// For mach-O binaries, the base address is the vmaddr of the `__TEXT` segment.
+    ///
+    /// For Windows binaries, the base address is the image load address.
+    pub fn add_mapping(
+        &mut self,
+        start_avma: u64,
+        end_avma: u64,
+        relative_address_at_start: u32,
+        value: T,
+    ) {
         let insertion_index = match self
             .sorted_lib_ranges
-            .binary_search_by_key(&range.start, |r| r.start)
+            .binary_search_by_key(&start_avma, |r| r.start_avma)
         {
             Ok(i) => {
                 // We already have a library mapping at this address.
@@ -100,21 +53,30 @@ impl<I> LibRanges<I> {
             Err(i) => i,
         };
 
-        self.sorted_lib_ranges.insert(insertion_index, range);
+        self.sorted_lib_ranges.insert(
+            insertion_index,
+            Mapping {
+                start_avma,
+                end_avma,
+                relative_address_at_start,
+                value,
+            },
+        );
     }
 
-    pub fn remove(&mut self, base_address: u64) {
-        self.sorted_lib_ranges.retain(|r| r.base != base_address);
+    pub fn remove_mapping(&mut self, start_avma: u64) {
+        self.sorted_lib_ranges
+            .retain(|r| r.start_avma != start_avma);
     }
 
-    pub fn lookup(&self, address: u64) -> Option<&LibRange<I>> {
+    fn lookup(&self, avma: u64) -> Option<&Mapping<T>> {
         let ranges = &self.sorted_lib_ranges[..];
-        let index = match ranges.binary_search_by_key(&address, |r| r.start) {
+        let index = match ranges.binary_search_by_key(&avma, |r| r.start_avma) {
             Err(0) => return None,
             Ok(exact_match) => exact_match,
             Err(insertion_index) => {
                 let range_index = insertion_index - 1;
-                if address < ranges[range_index].end {
+                if avma < ranges[range_index].end_avma {
                     range_index
                 } else {
                     return None;
@@ -123,12 +85,24 @@ impl<I> LibRanges<I> {
         };
         Some(&ranges[index])
     }
+
+    /// Converts an absolute address (AVMA, actual virtual memory address) into
+    /// a relative address and the mapping's associated value.
+    pub fn convert_address(&self, avma: u64) -> Option<(u32, &T)> {
+        let range = match self.lookup(avma) {
+            Some(range) => range,
+            None => return None,
+        };
+        let offset_from_mapping_start = (avma - range.start_avma) as u32;
+        let relative_address = range.relative_address_at_start + offset_from_mapping_start;
+        Some((relative_address, &range.value))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq)]
-struct LibRange<I> {
-    start: u64,
-    end: u64,
-    lib_index: I,
-    base: u64,
+struct Mapping<T> {
+    start_avma: u64,
+    end_avma: u64,
+    relative_address_at_start: u32,
+    value: T,
 }

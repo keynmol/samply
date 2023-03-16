@@ -10,11 +10,12 @@ use framehop::aarch64::UnwindRegsAarch64;
 use framehop::x86_64::UnwindRegsX86_64;
 use framehop::{FrameAddress, Module, ModuleSvmaInfo, ModuleUnwindData, TextByteData, Unwinder};
 use fxprof_processed_profile::{
-    CategoryColor, CategoryPairHandle, CpuDelta, Frame, FrameFlags, FrameInfo, LibraryInfo,
-    MarkerDynamicField, MarkerFieldFormat, MarkerLocation, MarkerSchema, MarkerSchemaField,
-    MarkerStaticField, MarkerTiming, ProcessHandle, Profile, ProfilerMarker, ReferenceTimestamp,
-    SamplingInterval, StringHandle, ThreadHandle, Timestamp,
+    CategoryColor, CategoryPairHandle, CpuDelta, Frame, FrameFlags, FrameInfo, LibraryHandle,
+    LibraryInfo, MarkerDynamicField, MarkerFieldFormat, MarkerLocation, MarkerSchema,
+    MarkerSchemaField, MarkerStaticField, MarkerTiming, ProcessHandle, Profile, ProfilerMarker,
+    ReferenceTimestamp, SamplingInterval, StringHandle, ThreadHandle, Timestamp,
 };
+use linux_perf_data::jitdump::{JitCodeLoadRecord, JitCodeMoveRecord, JitDumpHeader};
 use linux_perf_data::linux_perf_event_reader;
 use linux_perf_data::{AttributeDescription, DsoInfo, DsoKey};
 use linux_perf_event_reader::constants::{
@@ -33,7 +34,7 @@ use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
 use object::{
     FileKind, Object, ObjectSection, ObjectSegment, ObjectSymbol, SectionKind, SymbolKind,
 };
-use samply_symbols::{debug_id_for_object, DebugIdExt};
+use samply_symbols::{debug_id_and_code_id_for_jitdump, debug_id_for_object, DebugIdExt};
 use serde_json::json;
 use wholesym::samply_symbols;
 
@@ -45,6 +46,8 @@ use std::{ops::Range, path::Path};
 
 use self::jit_category_manager::JitCategoryManager;
 use self::kernel_symbols::KernelSymbols;
+
+use crate::utils::open_file_with_fallback;
 
 pub trait ConvertRegs {
     type UnwindRegs;
@@ -178,6 +181,7 @@ where
     suspected_pe_mappings: BTreeMap<u64, SuspectedPeMapping>,
 
     jit_category_manager: JitCategoryManager,
+    jitdump_code_offsets: HashMap<(LibraryHandle, u64), u32>,
 }
 
 const DEFAULT_OFF_CPU_SAMPLING_INTERVAL_NS: u64 = 1_000_000; // 1ms
@@ -244,6 +248,7 @@ where
             kernel_symbols,
             suspected_pe_mappings: BTreeMap::new(),
             jit_category_manager: JitCategoryManager::new(),
+            jitdump_code_offsets: HashMap::new(),
         }
     }
 
@@ -512,8 +517,7 @@ where
         }
 
         if e.pid == -1 {
-            let lib = self.kernel_lib(e.address, e.length, dso_key, build_id.as_deref(), &path);
-            self.profile.add_kernel_lib(lib);
+            self.add_kernel_module(e.address, e.length, dso_key, build_id.as_deref(), &path);
         } else {
             self.add_module_to_process(
                 e.pid,
@@ -733,14 +737,87 @@ where
         self.set_thread_name(e.pid, e.tid, &name, e.is_execve);
     }
 
-    fn kernel_lib(
-        &self,
+    pub fn lib_handle_for_jitdump(&mut self, path: &Path, header: &JitDumpHeader) -> LibraryHandle {
+        let (debug_id, code_id_bytes) =
+            debug_id_and_code_id_for_jitdump(header.pid, header.timestamp, header.elf_machine_arch);
+        let code_id = CodeId::from_binary(&code_id_bytes);
+        let path = path.to_string_lossy().into_owned();
+
+        self.profile.add_lib(LibraryInfo {
+            name: "JIT".into(),
+            debug_name: "JIT".into(),
+            path: path.clone(),
+            debug_path: path,
+            debug_id,
+            code_id: Some(code_id.to_string()),
+            arch: None,
+            symbol_table: None,
+        })
+    }
+
+    pub fn handle_jit_code_load(
+        &mut self,
+        record_offset_in_file: u64,
+        timestamp: u64,
+        jitdump_lib: LibraryHandle,
+        record: &JitCodeLoadRecord,
+    ) {
+        let process_pid = record.pid as i32;
+        let start_avma = record.code_addr;
+        let end_avma = start_avma + record.code_bytes.len() as u64;
+        let relative_address_at_start = record_offset_in_file as u32
+            + record.code_bytes_offset_from_record_header_start() as u32;
+        self.jitdump_code_offsets
+            .insert((jitdump_lib, record.code_index), relative_address_at_start);
+        self.add_jit_function(
+            process_pid,
+            timestamp,
+            start_avma,
+            end_avma,
+            std::str::from_utf8(&record.function_name.as_slice()).ok(),
+        );
+        let process = self.processes.get_by_pid(process_pid, &mut self.profile);
+        self.profile.add_lib_mapping(
+            process.profile_process,
+            jitdump_lib,
+            start_avma,
+            end_avma,
+            relative_address_at_start,
+        );
+    }
+
+    pub fn handle_jit_code_move(
+        &mut self,
+        _timestamp: u64,
+        jitdump_lib: LibraryHandle,
+        record: &JitCodeMoveRecord,
+    ) {
+        let process_pid = record.pid as i32;
+        let process = self.processes.get_by_pid(process_pid, &mut self.profile);
+        self.profile
+            .remove_lib_mapping(process.profile_process, record.old_code_addr);
+        if let Some(relative_address_at_start) = self
+            .jitdump_code_offsets
+            .get(&(jitdump_lib, record.code_index))
+        {
+            self.profile.add_lib_mapping(
+                process.profile_process,
+                jitdump_lib,
+                record.new_code_addr,
+                record.new_code_addr + record.code_size,
+                *relative_address_at_start,
+            );
+        }
+    }
+
+    fn add_kernel_module(
+        &mut self,
         base_address: u64,
         len: u64,
         dso_key: DsoKey,
         build_id: Option<&[u8]>,
         path: &[u8],
-    ) -> LibraryInfo {
+    ) {
         let path = std::str::from_utf8(path).unwrap().to_string();
         let build_id: Option<Vec<u8>> = match (build_id, self.kernel_symbols.as_ref()) {
             (None, Some(kernel_symbols)) if kernel_symbols.base_avma == base_address => {
@@ -772,9 +849,7 @@ where
             _ => None,
         };
 
-        LibraryInfo {
-            base_avma: base_address,
-            avma_range: base_address..(base_address + len),
+        let lib_handle = self.profile.add_lib(LibraryInfo {
             debug_id: debug_id.unwrap_or_default(),
             path,
             debug_path,
@@ -783,7 +858,9 @@ where
             debug_name: dso_key.name().to_string(),
             arch: None,
             symbol_table,
-        }
+        });
+        self.profile
+            .add_kernel_lib_mapping(lib_handle, base_address, base_address + len, 0);
     }
 
     /// Tell the unwinder about this module, and alsos create a ProfileModule
@@ -806,6 +883,7 @@ where
         timestamp: u64,
     ) {
         let process = self.processes.get_by_pid(process_pid, &mut self.profile);
+        let profile_process = process.profile_process;
 
         let path = std::str::from_utf8(path_slice).unwrap();
         let (mut file, mut path): (Option<_>, String) = match open_file_with_fallback(
@@ -1000,32 +1078,12 @@ where
 
             if name.starts_with("jitted-") && name.ends_with(".so") {
                 let symbol_name = jit_function_name(&file);
-                let (category, js_name) = self
-                    .jit_category_manager
-                    .classify_jit_symbol(symbol_name.unwrap_or(""), &mut self.profile);
-                process.jit_functions.insert(JitFunction {
-                    start_address: mapping_start_avma,
-                    end_address: mapping_end_avma,
-                    category,
-                    js_name,
-                });
-
-                let main_thread = self
-                    .threads
-                    .get_by_tid(
-                        process_pid,
-                        process.profile_process,
-                        true,
-                        &mut self.profile,
-                    )
-                    .profile_thread;
-                let timing =
-                    MarkerTiming::Instant(self.timestamp_converter.convert_time(timestamp));
-                self.profile.add_marker(
-                    main_thread,
-                    "JitFunctionAdd",
-                    JitFunctionAddMarker(symbol_name.unwrap_or("<unknown>").to_owned()),
-                    timing,
+                self.add_jit_function(
+                    process_pid,
+                    timestamp,
+                    mapping_start_avma,
+                    mapping_end_avma,
+                    symbol_name,
                 );
             };
         } else {
@@ -1042,20 +1100,59 @@ where
             code_id = build_id.map(|build_id| CodeId::from_binary(build_id).to_string());
         }
 
-        self.profile.add_lib(
-            process.profile_process,
-            LibraryInfo {
-                base_avma,
-                avma_range,
-                debug_id,
-                code_id,
-                path: path.clone(),
-                debug_path: path,
-                debug_name: name.clone(),
-                name,
-                arch: None,
-                symbol_table: None,
-            },
+        let lib_handle = self.profile.add_lib(LibraryInfo {
+            debug_id,
+            code_id,
+            path: path.clone(),
+            debug_path: path,
+            debug_name: name.clone(),
+            name,
+            arch: None,
+            symbol_table: None,
+        });
+        self.profile.add_lib_mapping(
+            profile_process,
+            lib_handle,
+            avma_range.start,
+            avma_range.end,
+            (avma_range.start - base_avma) as u32,
+        );
+    }
+
+    fn add_jit_function(
+        &mut self,
+        process_pid: i32,
+        timestamp: u64,
+        start_address: u64,
+        end_address: u64,
+        symbol_name: Option<&str>,
+    ) {
+        let process = self.processes.get_by_pid(process_pid, &mut self.profile);
+        let (category, js_name) = self
+            .jit_category_manager
+            .classify_jit_symbol(symbol_name.unwrap_or(""), &mut self.profile);
+        process.jit_functions.insert(JitFunction {
+            start_address,
+            end_address,
+            category,
+            js_name,
+        });
+
+        let main_thread = self
+            .threads
+            .get_by_tid(
+                process_pid,
+                process.profile_process,
+                true,
+                &mut self.profile,
+            )
+            .profile_thread;
+        let timing = MarkerTiming::Instant(self.timestamp_converter.convert_time(timestamp));
+        self.profile.add_marker(
+            main_thread,
+            "JitFunctionAdd",
+            JitFunctionAddMarker(symbol_name.unwrap_or("<unknown>").to_owned()),
+            timing,
         );
     }
 }
@@ -1391,20 +1488,6 @@ impl From<CpuMode> for StackMode {
             CpuMode::Kernel | CpuMode::GuestKernel => Self::Kernel,
             _ => Self::User,
         }
-    }
-}
-
-fn open_file_with_fallback(
-    path: &Path,
-    extra_dir: Option<&Path>,
-) -> std::io::Result<(std::fs::File, PathBuf)> {
-    match (std::fs::File::open(path), extra_dir, path.file_name()) {
-        (Ok(file), _, _) => Ok((file, path.to_owned())),
-        (Err(_), Some(extra_dir), Some(filename)) => {
-            let p: PathBuf = [extra_dir, Path::new(filename)].iter().collect();
-            std::fs::File::open(&p).map(|file| (file, p))
-        }
-        (Err(e), _, _) => Err(e),
     }
 }
 
