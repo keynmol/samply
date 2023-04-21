@@ -4,7 +4,7 @@ use framehop::{
     Unwinder, UnwinderNative,
 };
 use fxprof_processed_profile::debugid::DebugId;
-use fxprof_processed_profile::{LibraryInfo, ProcessHandle, Profile, Timestamp};
+use fxprof_processed_profile::{LibraryInfo, ProcessHandle, Profile, ThreadHandle, Timestamp};
 use mach::mach_types::thread_act_port_array_t;
 use mach::mach_types::thread_act_t;
 use mach::message::mach_msg_type_number_t;
@@ -96,6 +96,7 @@ pub struct TaskProfiler {
     unwinder: UnwinderNative<UnwindSectionBytes, MayAllocateDuringUnwind>,
     jitdump_path_receiver: Receiver<PathBuf>,
     jitdump_manager: JitDumpManager,
+    main_thread_handle: ThreadHandle,
     unresolved_samples: UnresolvedSamples,
     lib_mapping_ops: LibMappingOpQueue,
 }
@@ -132,6 +133,8 @@ impl TaskProfiler {
                 live_threads.insert(thread_act, thread);
             }
         }
+        let main_thread_handle = main_thread_handle.unwrap();
+
         Ok(TaskProfiler {
             task,
             pid,
@@ -144,7 +147,8 @@ impl TaskProfiler {
             ignored_errors: Vec::new(),
             unwinder: UnwinderNative::new(),
             jitdump_path_receiver,
-            jitdump_manager: JitDumpManager::new_for_process(main_thread_handle.unwrap()),
+            jitdump_manager: JitDumpManager::new_for_process(main_thread_handle),
+            main_thread_handle,
             lib_mapping_ops: Default::default(),
             unresolved_samples: Default::default(),
         })
@@ -415,6 +419,7 @@ impl TaskProfiler {
             self.jitdump_manager
                 .finish(jit_category_manager, profile, None, timestamp_converter),
             perf_map_mappings,
+            self.main_thread_handle,
         )
     }
 }

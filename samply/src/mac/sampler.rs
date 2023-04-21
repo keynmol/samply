@@ -209,6 +209,8 @@ impl Sampler {
                 &mut stack_frame_scratch_buf,
                 &unresolved_stacks,
                 &[],
+                &[],
+                None,
             );
         }
 

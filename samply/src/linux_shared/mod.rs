@@ -29,12 +29,14 @@ use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile};
 use object::{
     FileKind, Object, ObjectSection, ObjectSegment, ObjectSymbol, SectionKind, SymbolKind,
 };
+use rangemap::RangeSet;
 use samply_symbols::{debug_id_for_object, DebugIdExt};
 use wholesym::samply_symbols;
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Debug;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::{ops::Range, path::Path};
@@ -46,7 +48,7 @@ use crate::shared::jit_function_recycler::JitFunctionRecycler;
 use crate::shared::jitdump_manager::JitDumpManager;
 use crate::shared::lib_mappings::{LibMappingAdd, LibMappingInfo, LibMappingOp, LibMappingOpQueue};
 use crate::shared::perf_map::try_load_perf_map;
-use crate::shared::process_sample_data::{ProcessSampleData, RssStatMember};
+use crate::shared::process_sample_data::{MarkerSpan, ProcessSampleData, RssStatMember};
 use crate::shared::timestamp_converter::TimestampConverter;
 use crate::shared::types::{StackFrame, StackMode};
 use crate::shared::unresolved_samples::{
@@ -211,9 +213,34 @@ where
     /// Whether repeated frames at the base of the stack should be folded
     /// into one frame.
     fold_recursive_prefix: bool,
+
+    marker_spans: Vec<MarkerSpan>,
+
+    /// If Some(), only include samples which occurred during these ranges.
+    sample_ranges: Option<RangeSet<Timestamp>>,
 }
 
 const DEFAULT_OFF_CPU_SAMPLING_INTERVAL_NS: u64 = 1_000_000; // 1ms
+
+fn process_marker_span_line(
+    line: &str,
+    timestamp_converter: &TimestampConverter,
+) -> Option<MarkerSpan> {
+    let mut split = line.splitn(3, ' ');
+    let start_time = split.next()?;
+    let end_time = split.next()?;
+    let name = split.next()?.to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    let start_time = timestamp_converter.convert_time(start_time.parse::<u64>().ok()?);
+    let end_time = timestamp_converter.convert_time(end_time.parse::<u64>().ok()?);
+    Some(MarkerSpan {
+        start_time,
+        end_time,
+        name,
+    })
+}
 
 impl<U> Converter<U>
 where
@@ -232,6 +259,8 @@ where
         interpretation: EventInterpretation,
         merge_threads: bool,
         fold_recursive_prefix: bool,
+        marker_file: Option<&str>,
+        marker_name_for_filtering: Option<&str>,
     ) -> Self {
         let interval = match interpretation.sampling_is_time_based {
             Some(nanos) => SamplingInterval::from_nanos(nanos),
@@ -254,11 +283,34 @@ where
                 None
             }
         };
+
+        let timestamp_converter = TimestampConverter::with_reference_timestamp(first_sample_time);
+
+        let mut marker_spans = Vec::new();
+        let mut sample_ranges = RangeSet::new();
+        if let Some(marker_file) = marker_file {
+            let f = std::fs::File::open(marker_file).expect("Couldn't open marker file");
+            let r = std::io::BufReader::new(f);
+            let mut lines = r.lines();
+            while let Some(Ok(line)) = lines.next() {
+                if let Some(marker_span) = process_marker_span_line(&line, &timestamp_converter) {
+                    if marker_name_for_filtering.is_some()
+                        && marker_span.name == marker_name_for_filtering.unwrap()
+                    {
+                        sample_ranges.insert(marker_span.start_time..marker_span.end_time);
+                    }
+                    marker_spans.push(marker_span);
+                }
+            }
+        }
+        marker_spans.sort_by_key(|m| m.start_time);
+        let sample_ranges = marker_name_for_filtering.is_some().then_some(sample_ranges);
+
         Self {
             profile,
             cache,
             processes: Processes::new(merge_threads),
-            timestamp_converter: TimestampConverter::with_reference_timestamp(first_sample_time),
+            timestamp_converter,
             current_sample_time: first_sample_time,
             build_ids,
             endian,
@@ -276,6 +328,8 @@ where
             jit_category_manager: JitCategoryManager::new(),
             merge_threads,
             fold_recursive_prefix,
+            marker_spans,
+            sample_ranges,
         }
     }
 
@@ -287,6 +341,8 @@ where
             &self.event_names,
             &mut self.jit_category_manager,
             &self.timestamp_converter,
+            &self.marker_spans,
+            self.sample_ranges.as_ref(),
         );
         profile
     }
@@ -1511,6 +1567,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn finish(
         mut self,
         profile: &mut Profile,
@@ -1518,6 +1575,8 @@ where
         event_names: &[String],
         jit_category_manager: &mut JitCategoryManager,
         timestamp_converter: &TimestampConverter,
+        marker_spans: &[MarkerSpan],
+        sample_ranges: Option<&RangeSet<Timestamp>>,
     ) {
         // Gather the ProcessSampleData from any processes which are still alive at the end of profiling.
         for mut process in self.processes_by_pid.into_values() {
@@ -1543,6 +1602,8 @@ where
                 &mut stack_frame_scratch_buf,
                 unresolved_stacks,
                 event_names,
+                marker_spans,
+                sample_ranges,
             );
         }
     }
@@ -1658,6 +1719,7 @@ where
             std::mem::take(&mut self.lib_mapping_ops),
             jitdump_ops,
             perf_map_mappings,
+            self.threads.main_thread.profile_thread,
         )
     }
 

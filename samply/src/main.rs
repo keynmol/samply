@@ -139,6 +139,14 @@ pub struct ConversionArgs {
     /// Fold repeated frames at the base of the stack.
     #[arg(long)]
     fold_recursive_prefix: bool,
+
+    /// Create markers from the spans in this file.
+    #[arg(long)]
+    marker_file: Option<String>,
+
+    /// Only include samples which occurred during a marker with this name.
+    #[arg(long)]
+    filter_by_marker: Option<String>,
 }
 
 fn main() {
@@ -246,6 +254,8 @@ fn attempt_conversion(
         path.parent(),
         settings.merge_threads,
         settings.fold_recursive_prefix,
+        settings.marker_file.as_deref(),
+        settings.filter_by_marker.as_deref(),
     )
     .ok()?;
     let writer = BufWriter::new(output_file.as_file());
