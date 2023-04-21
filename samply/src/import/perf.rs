@@ -27,7 +27,7 @@ pub fn convert<C: Read + Seek>(
     merge_threads: bool,
     fold_recursive_prefix: bool,
     marker_file: Option<&str>,
-    marker_name_for_filtering: Option<&str>,
+    marker_name_prefix_for_filtering: Option<&str>,
 ) -> Result<Profile, Error> {
     let perf_file = PerfFileReader::parse_file(cursor)?;
 
@@ -43,7 +43,7 @@ pub fn convert<C: Read + Seek>(
                 merge_threads,
                 fold_recursive_prefix,
                 marker_file,
-                marker_name_for_filtering,
+                marker_name_prefix_for_filtering,
             )
         }
         _ => {
@@ -61,7 +61,7 @@ pub fn convert<C: Read + Seek>(
                 merge_threads,
                 fold_recursive_prefix,
                 marker_file,
-                marker_name_for_filtering,
+                marker_name_prefix_for_filtering,
             )
         }
     };
@@ -75,7 +75,7 @@ fn convert_impl<U, C, R>(
     merge_threads: bool,
     fold_recursive_prefix: bool,
     marker_file: Option<&str>,
-    marker_name_for_filtering: Option<&str>,
+    marker_name_prefix_for_filtering: Option<&str>,
 ) -> Profile
 where
     U: Unwinder<Module = Module<Vec<u8>>> + Default,
@@ -126,7 +126,7 @@ where
         merge_threads,
         fold_recursive_prefix,
         marker_file,
-        marker_name_for_filtering,
+        marker_name_prefix_for_filtering,
     );
 
     let mut last_timestamp = 0;

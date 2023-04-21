@@ -146,7 +146,7 @@ pub struct ConversionArgs {
 
     /// Only include samples which occurred during a marker with this name.
     #[arg(long)]
-    filter_by_marker: Option<String>,
+    filter_by_marker_prefix: Option<String>,
 }
 
 fn main() {
@@ -255,7 +255,7 @@ fn attempt_conversion(
         settings.merge_threads,
         settings.fold_recursive_prefix,
         settings.marker_file.as_deref(),
-        settings.filter_by_marker.as_deref(),
+        settings.filter_by_marker_prefix.as_deref(),
     )
     .ok()?;
     let writer = BufWriter::new(output_file.as_file());

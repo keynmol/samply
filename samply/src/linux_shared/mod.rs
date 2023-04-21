@@ -260,7 +260,7 @@ where
         merge_threads: bool,
         fold_recursive_prefix: bool,
         marker_file: Option<&str>,
-        marker_name_for_filtering: Option<&str>,
+        marker_name_prefix_for_filtering: Option<&str>,
     ) -> Self {
         let interval = match interpretation.sampling_is_time_based {
             Some(nanos) => SamplingInterval::from_nanos(nanos),
@@ -294,8 +294,10 @@ where
             let mut lines = r.lines();
             while let Some(Ok(line)) = lines.next() {
                 if let Some(marker_span) = process_marker_span_line(&line, &timestamp_converter) {
-                    if marker_name_for_filtering.is_some()
-                        && marker_span.name == marker_name_for_filtering.unwrap()
+                    if marker_name_prefix_for_filtering.is_some()
+                        && marker_span
+                            .name
+                            .starts_with(marker_name_prefix_for_filtering.unwrap())
                     {
                         sample_ranges.insert(marker_span.start_time..marker_span.end_time);
                     }
@@ -304,7 +306,9 @@ where
             }
         }
         marker_spans.sort_by_key(|m| m.start_time);
-        let sample_ranges = marker_name_for_filtering.is_some().then_some(sample_ranges);
+        let sample_ranges = marker_name_prefix_for_filtering
+            .is_some()
+            .then_some(sample_ranges);
 
         Self {
             profile,
