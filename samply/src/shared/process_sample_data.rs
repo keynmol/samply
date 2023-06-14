@@ -146,15 +146,15 @@ impl ProcessSampleData {
                     }
                 }
             }
+        }
 
-            for marker in marker_spans {
-                profile.add_marker(
-                    main_thread_handle,
-                    "UserTiming",
-                    UserTimingMarker(marker.name.clone()),
-                    MarkerTiming::Interval(marker.start_time, marker.end_time),
-                );
-            }
+        for marker in marker_spans {
+            profile.add_marker(
+                main_thread_handle,
+                "UserTiming",
+                UserTimingMarker(marker.name.clone()),
+                MarkerTiming::Interval(marker.start_time, marker.end_time),
+            );
         }
     }
 }
