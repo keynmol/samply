@@ -304,7 +304,12 @@ where
             );
         }
 
-        // 5. End addresses from text section ends
+        // 5. A placeholder symbol for the entry point.
+        if let Some(entry_point) = object_file.entry().checked_sub(base_address) {
+            entries.push((entry_point as u32, FullSymbolListEntry::Synthesized));
+        }
+
+        // 6. End addresses from text section ends
         // These entries serve to "terminate" the last function of each section,
         // so that addresses in the following section are not considered
         // to be part of the last function of that previous section.
@@ -320,7 +325,7 @@ where
                 }),
         );
 
-        // 6. End addresses for sized symbols
+        // 7. End addresses for sized symbols
         // These addresses serve to "terminate" functions symbols.
         entries.extend(
             object_file
@@ -342,7 +347,7 @@ where
                 }),
         );
 
-        // 7. End addresses for known functions ends
+        // 8. End addresses for known functions ends
         // These addresses serve to "terminate" functions from function_start_addresses.
         // They come from .eh_frame or .pdata info, which has the function size.
         if let Some(function_end_addresses) = function_end_addresses {
