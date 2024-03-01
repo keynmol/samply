@@ -611,8 +611,6 @@ dependencies = [
 [[package]]
 name = "framehop"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38bb3ea0d42943711eafa7a6182b47a21d51247d2ecad6641ff61d9213d099ea"
 dependencies = [
  "arrayvec",
  "fallible-iterator 0.3.0",
